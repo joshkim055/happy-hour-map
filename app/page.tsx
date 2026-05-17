@@ -5,19 +5,31 @@ import { createClient } from '@supabase/supabase-js';
 import { APIProvider, Map, AdvancedMarker, Pin, InfoWindow } from '@vis.gl/react-google-maps';
 
 const supabase = createClient(
-  process.env.NEXT_PUBLIC_SUPABASE_URL,
-  process.env.NEXT_PUBLIC_SUPABASE_KEY
+  process.env.NEXT_PUBLIC_SUPABASE_URL!,
+  process.env.NEXT_PUBLIC_SUPABASE_KEY!
 );
 
+interface Venue {
+  id: number;
+  name: string;
+  address: string;
+  latitude: number;
+  longitude: number;
+  happy_hour_start: string;
+  happy_hour_end: string;
+  days_active: string[];
+  deals: string;
+  is_active: boolean;
+}
+
 export default function Home() {
-  const [venues, setVenues] = useState([]);
-  const [selectedVenue, setSelectedVenue] = useState(null);
+  const [venues, setVenues] = useState<Venue[]>([]);
+  const [selectedVenue, setSelectedVenue] = useState<Venue | null>(null);
   const [activeCount, setActiveCount] = useState(0);
   const [filter, setFilter] = useState('all');
 
   useEffect(() => {
     fetchVenues();
-    // Refresh every 60 seconds
     const interval = setInterval(fetchVenues, 60000);
     return () => clearInterval(interval);
   }, []);
@@ -33,7 +45,7 @@ export default function Home() {
     }
 
     setVenues(data);
-    setActiveCount(data.filter(v => v.is_active).length);
+    setActiveCount(data.filter((v: Venue) => v.is_active).length);
   }
 
   const filteredVenues = filter === 'active' 
@@ -41,7 +53,7 @@ export default function Home() {
     : venues;
 
   return (
-    <APIProvider apiKey={process.env.NEXT_PUBLIC_GOOGLE_MAPS_KEY}>
+    <APIProvider apiKey={process.env.NEXT_PUBLIC_GOOGLE_MAPS_KEY!}>
       <div style={{ height: '100vh', width: '100vw', position: 'relative' }}>
         
         {/* Header bar */}
