@@ -1,8 +1,9 @@
 'use client';
 
-import { useEffect, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { createClient } from '@supabase/supabase-js';
 import { APIProvider, Map, AdvancedMarker, Pin, InfoWindow } from '@vis.gl/react-google-maps';
+import { isActiveNow } from '../lib/isActiveNow';
 
 const supabase = createClient(
   process.env.NEXT_PUBLIC_SUPABASE_URL!,
@@ -19,38 +20,50 @@ interface Venue {
   happy_hour_end: string;
   days_active: string[];
   deals: string;
+}
+
+// A venue plus whether its happy hour is on right now (worked out in the browser)
+interface VenueWithStatus extends Venue {
   is_active: boolean;
 }
 
 export default function Home() {
   const [venues, setVenues] = useState<Venue[]>([]);
-  const [selectedVenue, setSelectedVenue] = useState<Venue | null>(null);
-  const [activeCount, setActiveCount] = useState(0);
+  const [selectedId, setSelectedId] = useState<number | null>(null);
   const [filter, setFilter] = useState('all');
+  const [now, setNow] = useState(() => new Date());
 
+  // Load the venues once, then re-check the clock every minute so pins flip
+  // green/gray on their own without re-downloading the data.
   useEffect(() => {
-    fetchVenues();
-    const interval = setInterval(fetchVenues, 60000);
-    return () => clearInterval(interval);
-  }, []);
+    async function fetchVenues() {
+      const { data, error } = await supabase
+        .from('happy_hours')
+        .select('id, name, address, latitude, longitude, happy_hour_start, happy_hour_end, days_active, deals');
 
-  async function fetchVenues() {
-    const { data, error } = await supabase
-      .from('happy_hours')
-      .select('*');
-    
-    if (error) {
-      console.log('Error fetching venues:', error.message);
-      return;
+      if (error) {
+        console.log('Error fetching venues:', error.message);
+        return;
+      }
+
+      setVenues(data as Venue[]);
     }
 
-    setVenues(data);
-    setActiveCount(data.filter((v: Venue) => v.is_active).length);
-  }
+    fetchVenues();
+    const tick = setInterval(() => setNow(new Date()), 60000);
+    return () => clearInterval(tick);
+  }, []);
 
-  const filteredVenues = filter === 'active' 
-    ? venues.filter(v => v.is_active) 
-    : venues;
+  const venuesWithStatus: VenueWithStatus[] = useMemo(
+    () => venues.map(v => ({ ...v, is_active: isActiveNow(v, now) })),
+    [venues, now]
+  );
+  const activeCount = venuesWithStatus.filter(v => v.is_active).length;
+  const selectedVenue = venuesWithStatus.find(v => v.id === selectedId) ?? null;
+
+  const filteredVenues = filter === 'active'
+    ? venuesWithStatus.filter(v => v.is_active)
+    : venuesWithStatus;
 
   return (
     <APIProvider apiKey={process.env.NEXT_PUBLIC_GOOGLE_MAPS_KEY!}>
@@ -98,7 +111,7 @@ export default function Home() {
               <AdvancedMarker
                 key={venue.id}
                 position={{ lat: venue.latitude, lng: venue.longitude }}
-                onClick={() => setSelectedVenue(venue)}
+                onClick={() => setSelectedId(venue.id)}
               >
                 <Pin
                   background={venue.is_active ? '#16a34a' : '#9ca3af'}
@@ -112,7 +125,7 @@ export default function Home() {
           {selectedVenue && (
             <InfoWindow
               position={{ lat: selectedVenue.latitude, lng: selectedVenue.longitude }}
-              onCloseClick={() => setSelectedVenue(null)}
+              onCloseClick={() => setSelectedId(null)}
             >
               <div style={{ maxWidth: '220px', padding: '4px' }}>
                 <h3 style={{ margin: '0 0 6px', fontSize: '15px' }}>{selectedVenue.name}</h3>
