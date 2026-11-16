@@ -7,6 +7,7 @@ import VenueMap from '../components/VenueMap';
 import FilterSheet from '../components/FilterSheet';
 import PlaceSheet from '../components/PlaceSheet';
 import { bostonNow } from '../lib/isActiveNow';
+import { useNow } from '../lib/useNow';
 import {
   DAY_STARTS, NIGHT_STARTS, formatClock, formatDuration, matchesFilters, minutesUntilNight, modeAt, withStatus,
 } from '../lib/schedule';
@@ -47,7 +48,8 @@ function pillFor(v: VenueNow): { text: string; live: boolean } {
 export default function Home() {
   const [venues, setVenues] = useState<Venue[]>([]);
   const [loadError, setLoadError] = useState(false);
-  const [now, setNow] = useState(() => new Date());
+  const clock = useNow(); // null until the page is running in the browser
+  const now = clock ?? new Date(0);
   const [modeOverride, setModeOverride] = useState<Mode | null>(null);
   const [filters, setFilters] = useState<Filters>(EMPTY_FILTERS);
   const [onlyOpen, setOnlyOpen] = useState(false);
@@ -68,8 +70,6 @@ export default function Home() {
       setVenues((data || []) as Venue[]);
     }
     load();
-    const tick = setInterval(() => setNow(new Date()), 60000);
-    return () => clearInterval(tick);
   }, []);
 
   // Escape closes whichever panel is open.
@@ -83,14 +83,14 @@ export default function Home() {
 
   const { minutes } = bostonNow(now);
   const autoMode = modeAt(minutes);
-  const mode = modeOverride ?? autoMode;
+  const mode = modeOverride ?? (clock ? autoMode : 'day');
 
   const allTags = useMemo(() => [...new Set(venues.flatMap(v => v.tags || []))].sort(), [venues]);
   const neighborhoods = useMemo(() => [...new Set(venues.map(v => v.neighborhood).filter((n): n is string => !!n))].sort(), [venues]);
 
   const shown: VenueNow[] = useMemo(
-    () => venues.filter(v => matchesFilters(v, filters)).map(v => withStatus(v, now)).filter(v => !onlyOpen || v.isActive),
-    [venues, filters, now, onlyOpen]
+    () => clock ? venues.filter(v => matchesFilters(v, filters)).map(v => withStatus(v, clock)).filter(v => !onlyOpen || v.isActive) : [],
+    [venues, filters, clock, onlyOpen]
   );
   const active = shown.filter(v => v.isActive).sort((a, b) => (a.endsIn ?? 0) - (b.endsIn ?? 0));
   const soon = shown.filter(v => v.startsIn !== null).sort((a, b) => (a.startsIn ?? 0) - (b.startsIn ?? 0));
@@ -113,7 +113,7 @@ export default function Home() {
   ];
 
   return (
-    <div className="app" data-mode={mode} suppressHydrationWarning>
+    <div className="app" data-mode={mode}>
       <main className="panel">
         <header className="header">
           <div className="brand">
@@ -135,7 +135,7 @@ export default function Home() {
         </header>
 
         <div className="inner">
-          <h1 className="greeting" suppressHydrationWarning>{hello}<br />{subline}</h1>
+          <h1 className="greeting">{clock ? <>{hello}<br />{subline}</> : <>Boston happy hours,<br />by the hour.</>}</h1>
 
           <div className="search">
             <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" aria-hidden="true" style={{ color: 'var(--muted)' }}><circle cx="11" cy="11" r="7" /><path d="M20 20l-3.5-3.5" /></svg>
@@ -160,8 +160,8 @@ export default function Home() {
             ))}
           </div>
 
-          {autoMode === 'day' && (
-            <div className="countdown" suppressHydrationWarning>
+          {clock && autoMode === 'day' && (
+            <div className="countdown">
               <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="var(--accent-text)" strokeWidth="2" aria-hidden="true"><path d="M20 14.5A8 8 0 1 1 9.5 4 6.5 6.5 0 0 0 20 14.5z" /></svg>
               <div style={{ flex: 1 }}>
                 <div className="countdown-title">Night mode at 4:00</div>
