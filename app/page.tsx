@@ -20,6 +20,17 @@ interface Venue {
   happy_hour_end: string;
   days_active: string[];
   deals: string;
+  last_verified: string | null; // date the agent last confirmed the deal, e.g. "2026-11-15"
+}
+
+// Deals not confirmed within this many days are hidden from the map.
+const MAX_DAYS_SINCE_CONFIRMED = 60;
+
+// "2026-11-15" -> "Nov 15, 2026"
+function formatDate(isoDate: string): string {
+  return new Date(isoDate + 'T12:00:00').toLocaleDateString('en-US', {
+    month: 'short', day: 'numeric', year: 'numeric',
+  });
 }
 
 // A venue plus whether its happy hour is on right now (worked out in the browser)
@@ -36,10 +47,19 @@ export default function Home() {
   // Load the venues once, then re-check the clock every minute so pins flip
   // green/gray on their own without re-downloading the data.
   useEffect(() => {
+    function cutoffDate() {
+      const d = new Date();
+      d.setDate(d.getDate() - MAX_DAYS_SINCE_CONFIRMED);
+      return d.toISOString().split('T')[0];
+    }
+
     async function fetchVenues() {
       const { data, error } = await supabase
         .from('happy_hours')
-        .select('id, name, address, latitude, longitude, happy_hour_start, happy_hour_end, days_active, deals');
+        .select('id, name, address, latitude, longitude, happy_hour_start, happy_hour_end, days_active, deals, last_verified')
+        // Hide venues the agent marked as ended, and anything not confirmed in the last 60 days
+        .neq('status', 'hidden')
+        .gte('last_verified', cutoffDate());
 
       if (error) {
         console.log('Error fetching venues:', error.message);
@@ -149,6 +169,11 @@ export default function Home() {
                 }}>
                   {selectedVenue.is_active ? '✅ Active Now' : '⏸ Not Active'}
                 </span>
+                {selectedVenue.last_verified && (
+                  <p style={{ margin: '8px 0 0', fontSize: '11px', color: '#9ca3af' }}>
+                    Last confirmed {formatDate(selectedVenue.last_verified)}
+                  </p>
+                )}
               </div>
             </InfoWindow>
           )}
