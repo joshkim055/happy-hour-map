@@ -102,8 +102,27 @@ async function askClaudeForJson(prompt) {
   throw new Error('Claude did not finish after several rounds of searching');
 }
 
+const TAGS = ['cocktails', 'wine', 'beer', 'oysters', 'seafood', 'tacos', 'pizza', 'sushi', 'burgers',
+  'bar bites', 'tapas', 'steak', 'wings', 'brunch', 'coffee', 'late night'];
+
 const FIELD_RULES = `Times use 24-hour "HH:MM" format. days_active uses full day names like "Monday".
-If a happy hour runs past midnight, the end time is the after-midnight time (e.g. "22:00" to "01:00").`;
+If a happy hour runs past midnight, the end time is the after-midnight time (e.g. "22:00" to "01:00").
+"deals" is a clean customer-facing description of what's offered (1–2 sentences). Put any doubts, source
+conflicts or research notes in "notes", never in "deals".
+"deal_headline" is the single best deal in under 35 characters, e.g. "Every tapa $6", "$1 oysters, $3 sliders".
+"neighborhood" is the everyday neighborhood name people use, e.g. "South End", "Seaport", "Davis Square".
+"price_level" is 1–4 for the venue's normal prices ($ to $$$$).
+"tags" uses only these values: ${TAGS.join(', ')}.`;
+
+// Keeps only the display fields that look valid, so one odd answer can't break the app's filters.
+function displayFields(r) {
+  const out = {};
+  if (typeof r.deal_headline === 'string' && r.deal_headline.trim()) out.deal_headline = r.deal_headline.trim().slice(0, 60);
+  if (typeof r.neighborhood === 'string' && r.neighborhood.trim()) out.neighborhood = r.neighborhood.trim().slice(0, 60);
+  if (Number.isInteger(r.price_level) && r.price_level >= 1 && r.price_level <= 4) out.price_level = r.price_level;
+  if (Array.isArray(r.tags)) out.tags = [...new Set(r.tags.filter(t => TAGS.includes(t)))];
+  return out;
+}
 
 // ---------- Job 1: re-check existing venues ----------
 
@@ -133,14 +152,19 @@ Reply with ONLY a JSON object, no other text:
   "happy_hour_start": "HH:MM",
   "happy_hour_end": "HH:MM",
   "days_active": ["Monday"],
-  "deals": "short description",
+  "deals": "clean customer-facing description",
+  "deal_headline": "under 35 characters",
+  "neighborhood": "South End",
+  "price_level": 2,
+  "tags": ["tapas", "wine"],
   "source_url": "best URL for your evidence",
   "notes": "one sentence on what you found"
 }
-For "ended" or "unverified", the happy hour fields can be null.`;
+For "ended" or "unverified", the happy hour fields can be null, but still fill neighborhood, price_level and tags.`;
 
   const result = await askClaudeForJson(prompt);
-  const update = { last_checked: today(), check_notes: result.notes || null };
+  const update = { last_checked: today(), check_notes: result.notes || null, ...displayFields(result) };
+  if (result.outcome !== 'changed' && result.outcome !== 'confirmed') delete update.deal_headline;
 
   switch (result.outcome) {
     case 'confirmed':
@@ -286,7 +310,11 @@ Reply with ONLY a JSON array of 0–8 places (an empty array [] is fine if you f
     "happy_hour_start": "16:00",
     "happy_hour_end": "18:00",
     "days_active": ["Monday", "Tuesday"],
-    "deals": "Description of the deals",
+    "deals": "Clean customer-facing description of the deals",
+    "deal_headline": "under 35 characters",
+    "neighborhood": "Neighborhood name",
+    "price_level": 2,
+    "tags": ["cocktails", "bar bites"],
     "source_url": "URL where you found this"
   }
 ]`);
@@ -318,6 +346,7 @@ Reply with ONLY a JSON array of 0–8 places (an empty array [] is fine if you f
       days_active: place.days_active,
       deals: place.deals,
       source_url: place.source_url,
+      ...displayFields(place),
       ...coords,
       metro_id: metro.id,
       search_area_id: area.id,
