@@ -62,6 +62,15 @@ function must(result, what) {
   return result;
 }
 
+// What happened this run — saved to the agent_runs table so the weekly summary can report it.
+const report = {
+  recheck_summary: null,
+  changed_venues: [],
+  areas_searched: [],
+  venues_added: [],
+  metro_events: [],
+};
+
 // ---------- Talking to Claude ----------
 
 // Sends a prompt to Claude with web search turned on and returns the JSON it answers with.
@@ -181,6 +190,7 @@ async function recheckDueVenues() {
     try {
       const outcome = await recheckVenue(venue);
       tally[outcome in tally ? outcome : 'unverified']++;
+      if (outcome === 'changed' || outcome === 'ended') report.changed_venues.push({ name: venue.name, outcome });
       console.log(`  ${outcome.padEnd(10)} ${venue.name}`);
     } catch (e) {
       tally.failed++;
@@ -189,6 +199,7 @@ async function recheckDueVenues() {
     await sleep(1000);
   }
   console.log('Re-check summary:', tally);
+  report.recheck_summary = tally;
 }
 
 // ---------- Job 2: grow — search outward, ring by ring ----------
@@ -225,6 +236,7 @@ async function getActiveMetro() {
 
   must(await supabase.from('metros').update({ status: 'active' }).eq('id', queued[0].id), 'activating the next metro');
   console.log(`\nStarting a new metro area: ${queued[0].name}`);
+  report.metro_events.push(`Started ${queued[0].name}`);
   return { ...queued[0], status: 'active' };
 }
 
@@ -280,6 +292,7 @@ Reply with ONLY a JSON array of 0–8 places (an empty array [] is fine if you f
 ]`);
   } catch (e) {
     console.log(`  Search failed: ${e.message}`);
+    report.areas_searched.push({ name: area.name, ring: area.ring, added: 0, exhausted: false, failed: true, error: e.message.slice(0, 200) });
     return; // a failed search doesn't count toward exhausting the area
   }
 
@@ -320,6 +333,7 @@ Reply with ONLY a JSON array of 0–8 places (an empty array [] is fine if you f
       added++;
       knownNames.add(normalize(place.name));
       knownAddresses.add(normalizeAddress(place.address));
+      report.venues_added.push({ name: place.name, area: area.name });
       console.log(`  Added ${place.name}`);
     }
   }
@@ -333,6 +347,7 @@ Reply with ONLY a JSON array of 0–8 places (an empty array [] is fine if you f
     empty_runs_in_a_row: emptyRuns,
     exhausted,
   }).eq('id', area.id), 'updating the search area');
+  report.areas_searched.push({ name: area.name, ring: area.ring, added, exhausted, failed: false });
   console.log(`  ${added} new${exhausted ? ' — area exhausted, moving on next time' : ''}`);
 }
 
@@ -354,6 +369,7 @@ async function growMap() {
       .update({ status: 'exhausted', exhausted_at: new Date().toISOString() })
       .eq('id', metro.id), 'marking the metro exhausted');
     console.log(`\n${metro.name} is fully searched out to ~1 hour. Marked as exhausted.`);
+    report.metro_events.push(`${metro.name} exhausted`);
     const next = await getActiveMetro();
     if (next) console.log(`Next run will start on ${next.name}.`);
     return;
@@ -376,10 +392,36 @@ async function main() {
   console.log(`Last Call agent — ${new Date().toLocaleString('en-US', { timeZone: 'America/New_York' })}`);
   if (RUN_RECHECK) await recheckDueVenues();
   if (RUN_GROW) await growMap();
+
+  // If every search failed (e.g. a bad API key), call the run a failure even though nothing crashed.
+  const searches = report.areas_searched;
+  if (searches.length && searches.every(a => a.failed)) {
+    throw new Error(`Every area search failed — first error: ${searches[0].error}`);
+  }
   console.log('\nDone.');
 }
 
-main().catch(e => {
-  console.error('Agent crashed:', e);
-  process.exit(1);
-});
+// Records the run in agent_runs. Never lets a reporting problem hide the real result.
+async function saveReport(runId, status, error) {
+  try {
+    const { count } = await supabase
+      .from('happy_hours').select('id', { count: 'exact', head: true }).eq('status', 'live');
+    const fields = { ...report, status, error, live_venues: count ?? null, finished_at: new Date().toISOString() };
+    if (runId) await supabase.from('agent_runs').update(fields).eq('id', runId);
+    else await supabase.from('agent_runs').insert(fields);
+  } catch (e) {
+    console.error('Could not save the run report:', e.message);
+  }
+}
+
+(async () => {
+  const { data: run } = await supabase.from('agent_runs').insert({ status: 'running' }).select('id').single();
+  try {
+    await main();
+    await saveReport(run?.id, 'success', null);
+  } catch (e) {
+    console.error('Agent failed:', e);
+    await saveReport(run?.id, 'failed', String(e.message || e).slice(0, 1000));
+    process.exit(1);
+  }
+})();
