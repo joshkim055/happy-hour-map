@@ -187,9 +187,19 @@ async function recheckDueVenues() {
 
 // ---------- Job 2: grow — search outward, ring by ring ----------
 
-// "The Banshee Bar & Grill" -> "banshee bar grill", so small naming differences still match.
+// "The Banshee Bar & Grill (Fenway)" -> "banshee bar grill", so small naming differences still match.
 const normalize = name =>
-  name.toLowerCase().replace(/&/g, ' ').replace(/[^a-z0-9 ]/g, '').replace(/^the /, '').replace(/\s+/g, ' ').trim();
+  name.toLowerCase()
+    .replace(/\(.*?\)/g, ' ')        // drop "(Prudential)"-style notes
+    .replace(/\s[-–—]\s.*$/, ' ')     // drop " - South End"-style suffixes
+    .replace(/&/g, ' ').replace(/[^a-z0-9 ]/g, '').replace(/^the /, '').replace(/\s+/g, ' ').trim();
+
+// "800 Boylston Street, Unit 107, Boston" -> "800 boylston st", to catch the same place under two names.
+const normalizeAddress = address =>
+  (address || '').toLowerCase().split(',')[0]
+    .replace(/\bstreet\b/g, 'st').replace(/\bavenue\b/g, 'ave').replace(/\bboulevard\b/g, 'blvd')
+    .replace(/\broad\b/g, 'rd').replace(/\bplace\b/g, 'pl').replace(/\bsquare\b/g, 'sq')
+    .replace(/[^a-z0-9 ]/g, '').replace(/\s+/g, ' ').trim();
 
 async function geocodeAddress(address) {
   const url = `https://maps.googleapis.com/maps/api/geocode/json?address=${encodeURIComponent(address)}&key=${process.env.GOOGLE_MAPS_API_KEY}`;
@@ -241,7 +251,7 @@ async function pickAreas(metro) {
   return open.filter(a => a.ring === innermostRing).slice(0, AREAS_PER_RUN);
 }
 
-async function searchArea(area, metro, knownNames) {
+async function searchArea(area, metro, knownNames, knownAddresses) {
   console.log(`\nLooking for new happy hours in ${area.name} (ring ${area.ring})...`);
   let found = [];
   try {
@@ -270,6 +280,10 @@ Reply with ONLY a JSON array of 0–8 places (an empty array [] is fine if you f
   let added = 0;
   for (const place of Array.isArray(found) ? found : []) {
     if (!place.name || knownNames.has(normalize(place.name))) continue;
+    if (place.address && knownAddresses.has(normalizeAddress(place.address))) {
+      console.log(`  Skipped ${place.name} — already have a venue at that address`);
+      continue;
+    }
 
     const coords = await geocodeAddress(place.address);
     if (!coords) {
@@ -299,6 +313,7 @@ Reply with ONLY a JSON array of 0–8 places (an empty array [] is fine if you f
     } else {
       added++;
       knownNames.add(normalize(place.name));
+      knownAddresses.add(normalizeAddress(place.address));
       console.log(`  Added ${place.name}`);
     }
   }
@@ -338,12 +353,13 @@ async function growMap() {
     return;
   }
 
-  const { data: existing, error } = await supabase.from('happy_hours').select('name');
+  const { data: existing, error } = await supabase.from('happy_hours').select('name, address');
   if (error) throw new Error(error.message);
   const knownNames = new Set(existing.map(v => normalize(v.name)));
+  const knownAddresses = new Set(existing.map(v => normalizeAddress(v.address)));
 
   for (const area of areas) {
-    await searchArea(area, metro, knownNames);
+    await searchArea(area, metro, knownNames, knownAddresses);
     await sleep(2000);
   }
 }
