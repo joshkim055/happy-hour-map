@@ -56,6 +56,12 @@ const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SER
 const today = () => new Date().toISOString().split('T')[0];
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 
+// Unwraps a Supabase result, or stops the run with a clear message if the database said no.
+function must(result, what) {
+  if (result.error) throw new Error(`Database error while ${what}: ${result.error.message}`);
+  return result;
+}
+
 // ---------- Talking to Claude ----------
 
 // Sends a prompt to Claude with web search turned on and returns the JSON it answers with.
@@ -210,14 +216,14 @@ async function geocodeAddress(address) {
 
 // Returns the metro currently being worked on, activating the next queued one if needed.
 async function getActiveMetro() {
-  const { data: active } = await supabase.from('metros').select('*').eq('status', 'active').limit(1);
+  const { data: active } = must(await supabase.from('metros').select('*').eq('status', 'active').limit(1), 'loading the active metro');
   if (active?.length) return active[0];
 
-  const { data: queued } = await supabase
-    .from('metros').select('*').eq('status', 'queued').order('queue_order').limit(1);
+  const { data: queued } = must(await supabase
+    .from('metros').select('*').eq('status', 'queued').order('queue_order').limit(1), 'loading queued metros');
   if (!queued?.length) return null;
 
-  await supabase.from('metros').update({ status: 'active' }).eq('id', queued[0].id);
+  must(await supabase.from('metros').update({ status: 'active' }).eq('id', queued[0].id), 'activating the next metro');
   console.log(`\nStarting a new metro area: ${queued[0].name}`);
   return { ...queued[0], status: 'active' };
 }
@@ -233,19 +239,19 @@ Reply with ONLY a JSON array: [{"name": "Neighborhood, City, ST", "ring": 0}]`);
   const rows = areas
     .filter(a => a.name && Number.isInteger(a.ring))
     .map(a => ({ metro_id: metro.id, name: a.name, ring: Math.min(Math.max(a.ring, 0), 3) }));
-  await supabase.from('search_areas').upsert(rows, { onConflict: 'metro_id,name', ignoreDuplicates: true });
+  must(await supabase.from('search_areas').upsert(rows, { onConflict: 'metro_id,name', ignoreDuplicates: true }), 'saving new search areas');
   console.log(`  Added ${rows.length} areas`);
 }
 
 // Picks the most overdue unexhausted areas in the innermost unfinished ring.
 async function pickAreas(metro) {
-  const { data: open } = await supabase
+  const { data: open } = must(await supabase
     .from('search_areas')
     .select('*')
     .eq('metro_id', metro.id)
     .eq('exhausted', false)
     .order('ring', { ascending: true })
-    .order('last_searched', { ascending: true, nullsFirst: true });
+    .order('last_searched', { ascending: true, nullsFirst: true }), 'picking areas to search');
   if (!open?.length) return [];
   const innermostRing = open[0].ring;
   return open.filter(a => a.ring === innermostRing).slice(0, AREAS_PER_RUN);
@@ -320,13 +326,13 @@ Reply with ONLY a JSON array of 0–8 places (an empty array [] is fine if you f
 
   const emptyRuns = added === 0 ? area.empty_runs_in_a_row + 1 : 0;
   const exhausted = emptyRuns >= EMPTY_RUNS_TO_EXHAUST;
-  await supabase.from('search_areas').update({
+  must(await supabase.from('search_areas').update({
     last_searched: today(),
     searches: area.searches + 1,
     venues_added: area.venues_added + added,
     empty_runs_in_a_row: emptyRuns,
     exhausted,
-  }).eq('id', area.id);
+  }).eq('id', area.id), 'updating the search area');
   console.log(`  ${added} new${exhausted ? ' — area exhausted, moving on next time' : ''}`);
 }
 
@@ -337,16 +343,16 @@ async function growMap() {
     return;
   }
 
-  const { count } = await supabase
-    .from('search_areas').select('id', { count: 'exact', head: true }).eq('metro_id', metro.id);
+  const { count } = must(await supabase
+    .from('search_areas').select('id', { count: 'exact', head: true }).eq('metro_id', metro.id), 'counting search areas');
   if (!count) await seedAreasForMetro(metro);
 
   const areas = await pickAreas(metro);
   if (!areas.length) {
     // Every ring is exhausted: mark the metro finished. The reminder task watches for this.
-    await supabase.from('metros')
+    must(await supabase.from('metros')
       .update({ status: 'exhausted', exhausted_at: new Date().toISOString() })
-      .eq('id', metro.id);
+      .eq('id', metro.id), 'marking the metro exhausted');
     console.log(`\n${metro.name} is fully searched out to ~1 hour. Marked as exhausted.`);
     const next = await getActiveMetro();
     if (next) console.log(`Next run will start on ${next.name}.`);
