@@ -7,7 +7,7 @@
   "scripts": {
     "start": "node agent.js",
     "recheck": "node agent.js --recheck-only",
-    "discover": "node agent.js --discover-only"
+    "grow": "node agent.js --grow-only"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^1.8.0",

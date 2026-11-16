@@ -11,12 +11,16 @@
 //                    unverified → flag for review; last_verified stays the same, so the
 //                                 website hides it once it's 60 days since last confirmed
 //
-//   2. DISCOVER  — searches each neighborhood for happy hours we don't have yet and adds them.
+//   2. GROW      — searches a few areas per run for happy hours we don't have yet. Areas live in
+//                  the `search_areas` table in rings moving outward from the city center
+//                  (0 = core … 3 = ~1 hour away). An area is "exhausted" after two searches in a row
+//                  find nothing new; when every ring is exhausted the metro is marked finished and the
+//                  next queued metro (table `metros`) becomes active.
 //
 // Usage:
 //   node agent.js                  run both jobs
 //   node agent.js --recheck-only   only re-check existing venues
-//   node agent.js --discover-only  only look for new venues
+//   node agent.js --grow-only      only look for new venues
 
 import 'dotenv/config';
 import Anthropic from '@anthropic-ai/sdk';
@@ -25,18 +29,16 @@ import { createClient } from '@supabase/supabase-js';
 // ---------- Settings ----------
 
 const MODEL = process.env.ANTHROPIC_MODEL || 'claude-sonnet-5-5';
-const RECHECK_LIMIT = Number(process.env.RECHECK_LIMIT || 15); // venues re-checked per run
-const NEIGHBORHOODS = [
-  'Seaport Boston',
-  'Back Bay Boston',
-  'South End Boston',
-  'Fenway Boston',
-  'Downtown Boston',
-];
+// Re-check anything not checked in this many days. Kept well under the website's 60-day
+// hide rule so a venue normally gets re-confirmed before it would disappear.
+const RECHECK_AFTER_DAYS = Number(process.env.RECHECK_AFTER_DAYS || 40);
+const RECHECK_LIMIT = Number(process.env.RECHECK_LIMIT || 60); // safety cap per run
+const AREAS_PER_RUN = Number(process.env.AREAS_PER_RUN || 3);   // areas searched for new venues per run
+const EMPTY_RUNS_TO_EXHAUST = 2;                                // searches in a row with nothing new
 
 const args = process.argv.slice(2);
-const RUN_RECHECK = !args.includes('--discover-only');
-const RUN_DISCOVER = !args.includes('--recheck-only');
+const RUN_RECHECK = !args.includes('--grow-only');
+const RUN_GROW = !args.includes('--recheck-only');
 
 for (const key of ['ANTHROPIC_API_KEY', 'SUPABASE_URL', 'SUPABASE_SERVICE_ROLE_KEY', 'GOOGLE_MAPS_API_KEY']) {
   if (!process.env[key]) {
@@ -153,17 +155,20 @@ For "ended" or "unverified", the happy hour fields can be null.`;
   return result.outcome;
 }
 
-async function recheckOldestVenues() {
-  // Oldest-checked first, so every venue gets its turn over a few weekly runs.
+async function recheckDueVenues() {
+  // Everything not checked in RECHECK_AFTER_DAYS days, oldest first. As the map grows, more
+  // venues come due each week, so nothing silently ages past the 60-day hide rule.
+  const cutoff = new Date(Date.now() - RECHECK_AFTER_DAYS * 86400000).toISOString().split('T')[0];
   const { data: venues, error } = await supabase
     .from('happy_hours')
     .select('*')
     .neq('status', 'hidden')
+    .or(`last_checked.is.null,last_checked.lt.${cutoff}`)
     .order('last_checked', { ascending: true, nullsFirst: true })
     .limit(RECHECK_LIMIT);
   if (error) throw new Error(error.message);
 
-  console.log(`\nRe-checking ${venues.length} venues...`);
+  console.log(`\nRe-checking ${venues.length} venues due for a check...`);
   const tally = { confirmed: 0, changed: 0, ended: 0, unverified: 0, failed: 0 };
 
   for (const venue of venues) {
@@ -180,7 +185,7 @@ async function recheckOldestVenues() {
   console.log('Re-check summary:', tally);
 }
 
-// ---------- Job 2: discover new venues ----------
+// ---------- Job 2: grow — search outward, ring by ring ----------
 
 // "The Banshee Bar & Grill" -> "banshee bar grill", so small naming differences still match.
 const normalize = name =>
@@ -193,25 +198,63 @@ async function geocodeAddress(address) {
   return location ? { latitude: location.lat, longitude: location.lng } : null;
 }
 
-async function discoverNewVenues() {
-  const { data: existing, error } = await supabase.from('happy_hours').select('name');
-  if (error) throw new Error(error.message);
-  const knownNames = new Set(existing.map(v => normalize(v.name)));
+// Returns the metro currently being worked on, activating the next queued one if needed.
+async function getActiveMetro() {
+  const { data: active } = await supabase.from('metros').select('*').eq('status', 'active').limit(1);
+  if (active?.length) return active[0];
 
-  for (const neighborhood of NEIGHBORHOODS) {
-    console.log(`\nLooking for new happy hours in ${neighborhood}...`);
-    let found = [];
-    try {
-      found = await askClaudeForJson(`Search the web for bars and restaurants in ${neighborhood} that currently offer a happy hour.
+  const { data: queued } = await supabase
+    .from('metros').select('*').eq('status', 'queued').order('queue_order').limit(1);
+  if (!queued?.length) return null;
+
+  await supabase.from('metros').update({ status: 'active' }).eq('id', queued[0].id);
+  console.log(`\nStarting a new metro area: ${queued[0].name}`);
+  return { ...queued[0], status: 'active' };
+}
+
+// For a brand-new metro with no areas yet, ask Claude to lay out the rings.
+async function seedAreasForMetro(metro) {
+  console.log(`Planning search areas for ${metro.name}...`);
+  const areas = await askClaudeForJson(`List neighborhoods and towns with bar/restaurant scenes in and around ${metro.name},
+grouped into rings by travel time from the city center:
+ring 0 = core downtown neighborhoods, ring 1 = close-in neighborhoods, ring 2 = inner suburbs,
+ring 3 = places roughly 45–60 minutes away. Aim for 40–60 areas in total.
+Reply with ONLY a JSON array: [{"name": "Neighborhood, City, ST", "ring": 0}]`);
+  const rows = areas
+    .filter(a => a.name && Number.isInteger(a.ring))
+    .map(a => ({ metro_id: metro.id, name: a.name, ring: Math.min(Math.max(a.ring, 0), 3) }));
+  await supabase.from('search_areas').upsert(rows, { onConflict: 'metro_id,name', ignoreDuplicates: true });
+  console.log(`  Added ${rows.length} areas`);
+}
+
+// Picks the most overdue unexhausted areas in the innermost unfinished ring.
+async function pickAreas(metro) {
+  const { data: open } = await supabase
+    .from('search_areas')
+    .select('*')
+    .eq('metro_id', metro.id)
+    .eq('exhausted', false)
+    .order('ring', { ascending: true })
+    .order('last_searched', { ascending: true, nullsFirst: true });
+  if (!open?.length) return [];
+  const innermostRing = open[0].ring;
+  return open.filter(a => a.ring === innermostRing).slice(0, AREAS_PER_RUN);
+}
+
+async function searchArea(area, metro, knownNames) {
+  console.log(`\nLooking for new happy hours in ${area.name} (ring ${area.ring})...`);
+  let found = [];
+  try {
+    found = await askClaudeForJson(`Search the web for bars and restaurants in ${area.name} that currently offer a happy hour.
 Skip these places, which we already have: ${[...knownNames].join('; ')}.
 Only include places where you found specific, recent deal information (roughly the last 12 months).
 ${FIELD_RULES}
 
-Reply with ONLY a JSON array of 3–8 places, no other text:
+Reply with ONLY a JSON array of 0–8 places (an empty array [] is fine if you find nothing new), no other text:
 [
   {
     "name": "Bar Name",
-    "address": "Full street address, Boston, MA",
+    "address": "Full street address, City, ST",
     "happy_hour_start": "16:00",
     "happy_hour_end": "18:00",
     "days_active": ["Monday", "Tuesday"],
@@ -219,42 +262,88 @@ Reply with ONLY a JSON array of 3–8 places, no other text:
     "source_url": "URL where you found this"
   }
 ]`);
-    } catch (e) {
-      console.log(`  Search failed: ${e.message}`);
+  } catch (e) {
+    console.log(`  Search failed: ${e.message}`);
+    return; // a failed search doesn't count toward exhausting the area
+  }
+
+  let added = 0;
+  for (const place of Array.isArray(found) ? found : []) {
+    if (!place.name || knownNames.has(normalize(place.name))) continue;
+
+    const coords = await geocodeAddress(place.address);
+    if (!coords) {
+      console.log(`  Skipped ${place.name} — couldn't find it on the map`);
       continue;
     }
 
-    for (const place of Array.isArray(found) ? found : []) {
-      if (!place.name || knownNames.has(normalize(place.name))) continue;
+    const { error } = await supabase.from('happy_hours').insert({
+      name: place.name,
+      address: place.address,
+      happy_hour_start: place.happy_hour_start,
+      happy_hour_end: place.happy_hour_end,
+      days_active: place.days_active,
+      deals: place.deals,
+      source_url: place.source_url,
+      ...coords,
+      metro_id: metro.id,
+      search_area_id: area.id,
+      status: 'live',
+      last_verified: today(),
+      last_checked: today(),
+      check_notes: `Added by growth run (${area.name})`,
+    });
 
-      const coords = await geocodeAddress(place.address);
-      if (!coords) {
-        console.log(`  Skipped ${place.name} — couldn't find it on the map`);
-        continue;
-      }
-
-      const { error: insertError } = await supabase.from('happy_hours').insert({
-        name: place.name,
-        address: place.address,
-        happy_hour_start: place.happy_hour_start,
-        happy_hour_end: place.happy_hour_end,
-        days_active: place.days_active,
-        deals: place.deals,
-        source_url: place.source_url,
-        ...coords,
-        status: 'live',
-        last_verified: today(),
-        last_checked: today(),
-        check_notes: 'Added by discovery run',
-      });
-
-      if (insertError) {
-        console.log(`  Error saving ${place.name}: ${insertError.message}`);
-      } else {
-        knownNames.add(normalize(place.name));
-        console.log(`  Added ${place.name}`);
-      }
+    if (error) {
+      console.log(`  Error saving ${place.name}: ${error.message}`);
+    } else {
+      added++;
+      knownNames.add(normalize(place.name));
+      console.log(`  Added ${place.name}`);
     }
+  }
+
+  const emptyRuns = added === 0 ? area.empty_runs_in_a_row + 1 : 0;
+  const exhausted = emptyRuns >= EMPTY_RUNS_TO_EXHAUST;
+  await supabase.from('search_areas').update({
+    last_searched: today(),
+    searches: area.searches + 1,
+    venues_added: area.venues_added + added,
+    empty_runs_in_a_row: emptyRuns,
+    exhausted,
+  }).eq('id', area.id);
+  console.log(`  ${added} new${exhausted ? ' — area exhausted, moving on next time' : ''}`);
+}
+
+async function growMap() {
+  const metro = await getActiveMetro();
+  if (!metro) {
+    console.log('\nNo active or queued metro areas left — add one to the metros table to keep growing.');
+    return;
+  }
+
+  const { count } = await supabase
+    .from('search_areas').select('id', { count: 'exact', head: true }).eq('metro_id', metro.id);
+  if (!count) await seedAreasForMetro(metro);
+
+  const areas = await pickAreas(metro);
+  if (!areas.length) {
+    // Every ring is exhausted: mark the metro finished. The reminder task watches for this.
+    await supabase.from('metros')
+      .update({ status: 'exhausted', exhausted_at: new Date().toISOString() })
+      .eq('id', metro.id);
+    console.log(`\n${metro.name} is fully searched out to ~1 hour. Marked as exhausted.`);
+    const next = await getActiveMetro();
+    if (next) console.log(`Next run will start on ${next.name}.`);
+    return;
+  }
+
+  const { data: existing, error } = await supabase.from('happy_hours').select('name');
+  if (error) throw new Error(error.message);
+  const knownNames = new Set(existing.map(v => normalize(v.name)));
+
+  for (const area of areas) {
+    await searchArea(area, metro, knownNames);
     await sleep(2000);
   }
 }
@@ -263,8 +352,8 @@ Reply with ONLY a JSON array of 3–8 places, no other text:
 
 async function main() {
   console.log(`Last Call agent — ${new Date().toLocaleString('en-US', { timeZone: 'America/New_York' })}`);
-  if (RUN_RECHECK) await recheckOldestVenues();
-  if (RUN_DISCOVER) await discoverNewVenues();
+  if (RUN_RECHECK) await recheckDueVenues();
+  if (RUN_GROW) await growMap();
   console.log('\nDone.');
 }
 
