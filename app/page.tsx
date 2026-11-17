@@ -9,9 +9,10 @@ import PlaceSheet from '../components/PlaceSheet';
 import { bostonNow } from '../lib/isActiveNow';
 import { useNow } from '../lib/useNow';
 import {
-  DAY_STARTS, NIGHT_STARTS, formatClock, formatDuration, matchesFilters, minutesUntilNight, modeAt, withStatus,
+  DAY_STARTS, NIGHT_STARTS, formatClock, formatDuration, formatHour, matchesFilters, minutesUntilNight, modeAt,
+  toMinutes, todayName, withStatus,
 } from '../lib/schedule';
-import { EMPTY_FILTERS, type Filters, type Mode, type Venue, type VenueNow } from '../lib/types';
+import { EMPTY_FILTERS, WEEK, type Filters, type Mode, type Venue, type VenueNow } from '../lib/types';
 
 const supabase = createClient(
   process.env.NEXT_PUBLIC_SUPABASE_URL!,
@@ -37,6 +38,11 @@ function greeting(mode: Mode, minutes: number, activeCount: number): [string, st
   return [first, minutes < 15 * 60 ? 'Lunch is still on.' : 'Happy hour is close.'];
 }
 
+// "4pm–7pm", for browsing deals on any day
+function timeRange(v: Venue): string {
+  return v.happy_hour_start && v.happy_hour_end ? `${formatClock(v.happy_hour_start)}–${formatClock(v.happy_hour_end)}` : '—';
+}
+
 function pillFor(v: VenueNow): { text: string; live: boolean } {
   if (v.isActive && v.happy_hour_end) return { text: `Until ${formatClock(v.happy_hour_end)}`, live: true };
   if (v.startsIn !== null && v.happy_hour_start) {
@@ -52,7 +58,8 @@ export default function Home() {
   const now = clock ?? new Date(0);
   const [modeOverride, setModeOverride] = useState<Mode | null>(null);
   const [filters, setFilters] = useState<Filters>(EMPTY_FILTERS);
-  const [onlyOpen, setOnlyOpen] = useState(false);
+  // "live" = only deals happening right now; "all" = everything, browsable by day and hour
+  const [view, setView] = useState<'live' | 'all'>('all');
   const [showFilters, setShowFilters] = useState(false);
   const [selectedId, setSelectedId] = useState<number | null>(null);
 
@@ -89,15 +96,24 @@ export default function Home() {
   const neighborhoods = useMemo(() => [...new Set(venues.map(v => v.neighborhood).filter((n): n is string => !!n))].sort(), [venues]);
 
   const shown: VenueNow[] = useMemo(
-    () => clock ? venues.filter(v => matchesFilters(v, filters)).map(v => withStatus(v, clock)).filter(v => !onlyOpen || v.isActive) : [],
-    [venues, filters, clock, onlyOpen]
+    () => clock ? venues.filter(v => matchesFilters(v, filters)).map(v => withStatus(v, clock)).filter(v => view === 'all' || v.isActive) : [],
+    [venues, filters, clock, view]
   );
   const active = shown.filter(v => v.isActive).sort((a, b) => (a.endsIn ?? 0) - (b.endsIn ?? 0));
   const soon = shown.filter(v => v.startsIn !== null).sort((a, b) => (a.startsIn ?? 0) - (b.startsIn ?? 0));
   const later = shown.filter(v => !v.isActive && v.startsIn === null).sort((a, b) => a.name.localeCompare(b.name));
   const selected = shown.find(v => v.id === selectedId) ?? (selectedId ? venues.map(v => withStatus(v, now)).find(v => v.id === selectedId) : undefined);
 
-  const filterCount = filters.tags.length + filters.prices.length + filters.neighborhoods.length + (filters.hours ? 1 : 0);
+  const filterCount = filters.tags.length + filters.prices.length + filters.neighborhoods.length + (filters.hours ? 1 : 0) + (filters.days.length ? 1 : 0);
+  // Browsing = a day or hour filter is set, so the list is laid out like a schedule instead of "right now".
+  const browsing = filters.days.length > 0 || filters.hours !== null;
+  const today = clock ? todayName(clock) : '';
+  const byStart = (a: Venue, b: Venue) =>
+    (a.happy_hour_start ? toMinutes(a.happy_hour_start) : 0) - (b.happy_hour_start ? toMinutes(b.happy_hour_start) : 0) || a.name.localeCompare(b.name);
+  const browseNote = [
+    filters.days.length === 7 ? 'Every day' : filters.days.map(d => d.slice(0, 3)).join(', '),
+    filters.hours ? `${formatHour(filters.hours[0])} to ${formatHour(filters.hours[1])}` : '',
+  ].filter(Boolean).join(' · ');
   const [hello, subline] = greeting(mode, minutes, venues.map(v => withStatus(v, now)).filter(v => v.isActive).length);
   const untilNight = minutesUntilNight(minutes);
   const dayProgress = Math.min(1, Math.max(0, (minutes - DAY_STARTS) / (NIGHT_STARTS - DAY_STARTS)));
@@ -106,11 +122,17 @@ export default function Home() {
     setFilters(f => ({ ...f, tags: f.tags.includes(t) ? f.tags.filter(x => x !== t) : [...f.tags, t] }));
   }
 
-  const sections: { title: string; items: VenueNow[] }[] = [
-    { title: mode === 'night' ? 'Happening now' : 'On now', items: active },
-    { title: 'Starting soon', items: soon },
-    { title: 'Other days', items: later },
-  ];
+  const sections: { title: string; items: VenueNow[]; day?: string }[] = browsing
+    ? (filters.days.length ? WEEK.filter(d => filters.days.includes(d)) : WEEK).map(day => ({
+        title: day === today ? `${day} · Today` : day,
+        day,
+        items: shown.filter(v => v.days_active?.includes(day)).sort(byStart),
+      }))
+    : [
+        { title: mode === 'night' ? 'Happening now' : 'On now', items: active },
+        { title: 'Starting soon', items: soon },
+        { title: 'Other days', items: later },
+      ];
 
   return (
     <div className="app" data-mode={mode}>
@@ -153,8 +175,21 @@ export default function Home() {
             </button>
           </div>
 
+          <div className="segmented" role="group" aria-label="Which deals to show">
+            <button aria-pressed={view === 'live'} onClick={() => { setView('live'); setFilters(f => ({ ...f, days: [], hours: null })); }}>
+              <span className="live-dot" aria-hidden="true" />Live now
+            </button>
+            <button aria-pressed={view === 'all'} onClick={() => setView('all')}>All deals</button>
+          </div>
+
+          {browsing && (
+            <div className="browse-note">
+              <span>Showing <strong style={{ color: 'var(--ink)' }}>{browseNote}</strong></span>
+              <button className="text-btn" style={{ height: 32 }} onClick={() => setFilters(f => ({ ...f, days: [], hours: null }))}>Back to today</button>
+            </div>
+          )}
+
           <div className="chips scroll" style={{ marginTop: 14 }}>
-            <button className="chip" aria-pressed={onlyOpen} onClick={() => setOnlyOpen(o => !o)}>Open now</button>
             {QUICK_TAGS[mode].filter(t => allTags.includes(t)).map(t => (
               <button key={t} className="chip" aria-pressed={filters.tags.includes(t)} onClick={() => toggleQuickTag(t)}>{t}</button>
             ))}
@@ -174,7 +209,11 @@ export default function Home() {
 
         {loadError && <p className="empty">We couldn’t load happy hours right now. Try refreshing in a minute.</p>}
         {!loadError && venues.length > 0 && shown.length === 0 && (
-          <p className="empty">Nothing matches those filters. Try clearing a few, or pick a wider time window.</p>
+          <p className="empty">
+            {view === 'live'
+              ? 'Nothing is on right now with those filters. Switch to All deals to see what’s coming up.'
+              : 'Nothing matches those filters. Try clearing a few, or pick a wider time window.'}
+          </p>
         )}
 
         {sections.filter(s => s.items.length).map(s => (
@@ -184,7 +223,9 @@ export default function Home() {
               <span className="section-count">{s.items.length}</span>
             </div>
             {s.items.map(v => {
-              const pill = pillFor(v);
+              const pill = s.day
+                ? { text: timeRange(v), live: s.day === today && v.isActive }
+                : pillFor(v);
               return (
                 <button key={v.id} className="row" onClick={() => setSelectedId(v.id)}>
                   <div style={{ flex: 1, minWidth: 0 }}>
@@ -214,7 +255,7 @@ export default function Home() {
           tags={allTags}
           neighborhoods={neighborhoods}
           resultCount={f => venues.filter(v => matchesFilters(v, f)).length}
-          onApply={f => { setFilters(f); setShowFilters(false); }}
+          onApply={f => { setFilters(f); if (f.days.length || f.hours) setView('all'); setShowFilters(false); }}
           onClose={() => setShowFilters(false)}
         />
       )}

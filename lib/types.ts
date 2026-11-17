@@ -32,6 +32,9 @@ export interface Filters {
   prices: number[];
   neighborhoods: string[];
   hours: [number, number] | null; // e.g. [16, 19] = 4pm to 7pm; null = any time
+  days: string[];                 // e.g. ["Friday", "Saturday"]; empty = any day
 }
 
-export const EMPTY_FILTERS: Filters = { query: '', tags: [], prices: [], neighborhoods: [], hours: null };
+export const EMPTY_FILTERS: Filters = { query: '', tags: [], prices: [], neighborhoods: [], hours: null, days: [] };
+
+export const WEEK = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday'];

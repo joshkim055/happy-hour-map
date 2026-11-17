@@ -2,7 +2,11 @@
 
 import { useState } from 'react';
 import { formatHour, NIGHT_STARTS } from '../lib/schedule';
-import { EMPTY_FILTERS, type Filters } from '../lib/types';
+import { EMPTY_FILTERS, WEEK, type Filters } from '../lib/types';
+
+const WEEKDAYS = WEEK.slice(0, 5);
+const WEEKEND = WEEK.slice(5);
+const sameDays = (a: string[], b: string[]) => a.length === b.length && b.every(d => a.includes(d));
 
 const HOURS = [11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24]; // 11am to midnight
 
@@ -69,6 +73,25 @@ export default function FilterSheet({ initial, tags, neighborhoods, resultCount,
             <p style={{ fontSize: 12, color: 'var(--muted)', margin: '8px 0 0' }}>
               {pendingStart !== null ? 'Now tap the last hour.' : 'Tap a start hour, then an end hour. The moon marks night mode.'}
             </p>
+          </section>
+
+          <section>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline' }}>
+              <h3 className="field-label">Day of the week</h3>
+              <span style={{ fontSize: 13, fontWeight: 600, color: 'var(--accent-text)' }}>
+                {draft.days.length ? (draft.days.length === 7 ? 'Every day' : `${draft.days.length} selected`) : 'Any day'}
+              </span>
+            </div>
+            <div className="chips" style={{ marginBottom: 8 }}>
+              <button className="chip" aria-pressed={sameDays(draft.days, WEEKDAYS)} onClick={() => setDraft({ ...draft, days: sameDays(draft.days, WEEKDAYS) ? [] : WEEKDAYS })}>Weekdays</button>
+              <button className="chip" aria-pressed={sameDays(draft.days, WEEKEND)} onClick={() => setDraft({ ...draft, days: sameDays(draft.days, WEEKEND) ? [] : WEEKEND })}>Weekend</button>
+            </div>
+            <div className="days">
+              {WEEK.map(d => (
+                <button key={d} className="day" aria-pressed={draft.days.includes(d)} aria-label={d}
+                  onClick={() => setDraft({ ...draft, days: toggle(draft.days, d) })}>{d.slice(0, 3)}</button>
+              ))}
+            </div>
           </section>
 
           <section>
