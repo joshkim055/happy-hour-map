@@ -2,200 +2,223 @@
 
 import { useEffect, useMemo, useState } from 'react';
 import { createClient } from '@supabase/supabase-js';
-import { APIProvider, Map, AdvancedMarker, Pin, InfoWindow } from '@vis.gl/react-google-maps';
-import { isActiveNow } from '../lib/isActiveNow';
+import Logo from '../components/Logo';
+import VenueMap from '../components/VenueMap';
+import FilterSheet from '../components/FilterSheet';
+import PlaceSheet from '../components/PlaceSheet';
+import { bostonNow } from '../lib/isActiveNow';
+import { useNow } from '../lib/useNow';
+import {
+  DAY_STARTS, NIGHT_STARTS, formatClock, formatDuration, matchesFilters, minutesUntilNight, modeAt, withStatus,
+} from '../lib/schedule';
+import { EMPTY_FILTERS, type Filters, type Mode, type Venue, type VenueNow } from '../lib/types';
 
 const supabase = createClient(
   process.env.NEXT_PUBLIC_SUPABASE_URL!,
   process.env.NEXT_PUBLIC_SUPABASE_KEY!
 );
 
-interface Venue {
-  id: number;
-  name: string;
-  address: string;
-  latitude: number;
-  longitude: number;
-  happy_hour_start: string;
-  happy_hour_end: string;
-  days_active: string[];
-  deals: string;
-  last_verified: string | null; // date the agent last confirmed the deal, e.g. "2026-11-15"
-}
-
 // Deals not confirmed within this many days are hidden from the map.
 const MAX_DAYS_SINCE_CONFIRMED = 60;
+const QUICK_TAGS: Record<Mode, string[]> = {
+  day: ['oysters', 'tacos', 'pizza', 'bar bites', 'sushi'],
+  night: ['cocktails', 'oysters', 'late night', 'wine', 'tapas'],
+};
+const SHORT_DAY: Record<string, string> = {
+  Monday: 'Mon', Tuesday: 'Tue', Wednesday: 'Wed', Thursday: 'Thu', Friday: 'Fri', Saturday: 'Sat', Sunday: 'Sun',
+};
 
-// "2026-11-15" -> "Nov 15, 2026"
-function formatDate(isoDate: string): string {
-  return new Date(isoDate + 'T12:00:00').toLocaleDateString('en-US', {
-    month: 'short', day: 'numeric', year: 'numeric',
-  });
+function greeting(mode: Mode, minutes: number, activeCount: number): [string, string] {
+  if (mode === 'night') {
+    const first = minutes >= 22 * 60 || minutes < DAY_STARTS ? 'Out late?' : 'Good evening.';
+    return [first, activeCount ? `${activeCount} ${activeCount === 1 ? 'deal is' : 'deals are'} on right now.` : 'Here’s what’s coming up.'];
+  }
+  const first = minutes < 12 * 60 ? 'Good morning.' : 'Good afternoon.';
+  return [first, minutes < 15 * 60 ? 'Lunch is still on.' : 'Happy hour is close.'];
 }
 
-// A venue plus whether its happy hour is on right now (worked out in the browser)
-interface VenueWithStatus extends Venue {
-  is_active: boolean;
+function pillFor(v: VenueNow): { text: string; live: boolean } {
+  if (v.isActive && v.happy_hour_end) return { text: `Until ${formatClock(v.happy_hour_end)}`, live: true };
+  if (v.startsIn !== null && v.happy_hour_start) {
+    return { text: v.startsIn < 60 ? `In ${formatDuration(v.startsIn)}` : formatClock(v.happy_hour_start), live: false };
+  }
+  return { text: (v.days_active || []).map(d => SHORT_DAY[d]).filter(Boolean).slice(0, 3).join(' ') || '—', live: false };
 }
 
 export default function Home() {
   const [venues, setVenues] = useState<Venue[]>([]);
+  const [loadError, setLoadError] = useState(false);
+  const clock = useNow(); // null until the page is running in the browser
+  const now = clock ?? new Date(0);
+  const [modeOverride, setModeOverride] = useState<Mode | null>(null);
+  const [filters, setFilters] = useState<Filters>(EMPTY_FILTERS);
+  const [onlyOpen, setOnlyOpen] = useState(false);
+  const [showFilters, setShowFilters] = useState(false);
   const [selectedId, setSelectedId] = useState<number | null>(null);
-  const [filter, setFilter] = useState('all');
-  const [now, setNow] = useState(() => new Date());
 
-  // Load the venues once, then re-check the clock every minute so pins flip
-  // green/gray on their own without re-downloading the data.
+  // Load venues once; re-check the clock every minute so everything updates on its own.
   useEffect(() => {
-    function cutoffDate() {
-      const d = new Date();
-      d.setDate(d.getDate() - MAX_DAYS_SINCE_CONFIRMED);
-      return d.toISOString().split('T')[0];
-    }
-
-    async function fetchVenues() {
+    async function load() {
+      const cutoff = new Date();
+      cutoff.setDate(cutoff.getDate() - MAX_DAYS_SINCE_CONFIRMED);
       const { data, error } = await supabase
         .from('happy_hours')
-        .select('id, name, address, latitude, longitude, happy_hour_start, happy_hour_end, days_active, deals, last_verified')
-        // Hide venues the agent marked as ended, and anything not confirmed in the last 60 days
+        .select('id, name, address, latitude, longitude, happy_hour_start, happy_hour_end, days_active, deals, deal_headline, neighborhood, price_level, tags, last_verified, source_url')
         .neq('status', 'hidden')
-        .gte('last_verified', cutoffDate());
-
-      if (error) {
-        console.log('Error fetching venues:', error.message);
-        return;
-      }
-
-      setVenues(data as Venue[]);
+        .gte('last_verified', cutoff.toISOString().split('T')[0]);
+      if (error) { setLoadError(true); return; }
+      setVenues((data || []) as Venue[]);
     }
-
-    fetchVenues();
-    const tick = setInterval(() => setNow(new Date()), 60000);
-    return () => clearInterval(tick);
+    load();
   }, []);
 
-  const venuesWithStatus: VenueWithStatus[] = useMemo(
-    () => venues.map(v => ({ ...v, is_active: isActiveNow(v, now) })),
-    [venues, now]
-  );
-  const activeCount = venuesWithStatus.filter(v => v.is_active).length;
-  const selectedVenue = venuesWithStatus.find(v => v.id === selectedId) ?? null;
+  // Escape closes whichever panel is open.
+  useEffect(() => {
+    function onKey(e: KeyboardEvent) {
+      if (e.key === 'Escape') { setShowFilters(false); setSelectedId(null); }
+    }
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, []);
 
-  const filteredVenues = filter === 'active'
-    ? venuesWithStatus.filter(v => v.is_active)
-    : venuesWithStatus;
+  const { minutes } = bostonNow(now);
+  const autoMode = modeAt(minutes);
+  const mode = modeOverride ?? (clock ? autoMode : 'day');
+
+  const allTags = useMemo(() => [...new Set(venues.flatMap(v => v.tags || []))].sort(), [venues]);
+  const neighborhoods = useMemo(() => [...new Set(venues.map(v => v.neighborhood).filter((n): n is string => !!n))].sort(), [venues]);
+
+  const shown: VenueNow[] = useMemo(
+    () => clock ? venues.filter(v => matchesFilters(v, filters)).map(v => withStatus(v, clock)).filter(v => !onlyOpen || v.isActive) : [],
+    [venues, filters, clock, onlyOpen]
+  );
+  const active = shown.filter(v => v.isActive).sort((a, b) => (a.endsIn ?? 0) - (b.endsIn ?? 0));
+  const soon = shown.filter(v => v.startsIn !== null).sort((a, b) => (a.startsIn ?? 0) - (b.startsIn ?? 0));
+  const later = shown.filter(v => !v.isActive && v.startsIn === null).sort((a, b) => a.name.localeCompare(b.name));
+  const selected = shown.find(v => v.id === selectedId) ?? (selectedId ? venues.map(v => withStatus(v, now)).find(v => v.id === selectedId) : undefined);
+
+  const filterCount = filters.tags.length + filters.prices.length + filters.neighborhoods.length + (filters.hours ? 1 : 0);
+  const [hello, subline] = greeting(mode, minutes, venues.map(v => withStatus(v, now)).filter(v => v.isActive).length);
+  const untilNight = minutesUntilNight(minutes);
+  const dayProgress = Math.min(1, Math.max(0, (minutes - DAY_STARTS) / (NIGHT_STARTS - DAY_STARTS)));
+
+  function toggleQuickTag(t: string) {
+    setFilters(f => ({ ...f, tags: f.tags.includes(t) ? f.tags.filter(x => x !== t) : [...f.tags, t] }));
+  }
+
+  const sections: { title: string; items: VenueNow[] }[] = [
+    { title: mode === 'night' ? 'Happening now' : 'On now', items: active },
+    { title: 'Starting soon', items: soon },
+    { title: 'Other days', items: later },
+  ];
 
   return (
-    <APIProvider apiKey={process.env.NEXT_PUBLIC_GOOGLE_MAPS_KEY!}>
-      <div style={{ height: '100vh', width: '100vw', position: 'relative' }}>
-        
-        {/* Header bar */}
-        <div style={{
-          position: 'absolute', top: 0, left: 0, right: 0, zIndex: 10,
-          background: 'white', padding: '12px 20px',
-          boxShadow: '0 2px 8px rgba(0,0,0,0.15)',
-          display: 'flex', alignItems: 'center', gap: '16px'
-        }}>
-          <h1 style={{ margin: 0, fontSize: '20px', fontWeight: 'bold' }}>
-            🍺 Boston Happy Hours
-          </h1>
-          <span style={{
-            background: activeCount > 0 ? '#16a34a' : '#6b7280',
-            color: 'white', borderRadius: '20px',
-            padding: '4px 12px', fontSize: '14px'
-          }}>
-            {activeCount} active now
-          </span>
+    <div className="app" data-mode={mode}>
+      <main className="panel">
+        <header className="header">
+          <div className="brand">
+            <Logo night={mode === 'night'} />
+            <span className="wordmark">four</span>
+          </div>
           <button
-            onClick={() => setFilter(filter === 'all' ? 'active' : 'all')}
-            style={{
-              background: filter === 'active' ? '#1d4ed8' : '#e5e7eb',
-              color: filter === 'active' ? 'white' : '#374151',
-              border: 'none', borderRadius: '8px',
-              padding: '6px 14px', cursor: 'pointer', fontSize: '14px'
-            }}
+            className="mode-toggle"
+            onClick={() => setModeOverride(mode === 'day' ? (autoMode === 'night' ? null : 'night') : (autoMode === 'day' ? null : 'day'))}
+            aria-label={`Switch to ${mode === 'day' ? 'night' : 'day'} mode`}
           >
-            {filter === 'active' ? 'Show All' : 'Active Only'}
+            {mode === 'day' ? (
+              <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" aria-hidden="true"><circle cx="12" cy="12" r="4" /><path d="M12 2v2M12 20v2M2 12h2M20 12h2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4" /></svg>
+            ) : (
+              <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" aria-hidden="true"><path d="M20 14.5A8 8 0 1 1 9.5 4 6.5 6.5 0 0 0 20 14.5z" /></svg>
+            )}
+            {mode === 'day' ? 'Day' : 'Night'}
           </button>
-        </div>
+        </header>
 
-        {/* Map */}
-        <Map
-          mapId="happy-hour-map"
-          defaultCenter={{ lat: 42.3601, lng: -71.0589 }}
-          defaultZoom={13}
-          style={{ width: '100%', height: '100%' }}
-        >
-          {filteredVenues.map(venue => (
-            venue.latitude && venue.longitude && (
-              <AdvancedMarker
-                key={venue.id}
-                position={{ lat: venue.latitude, lng: venue.longitude }}
-                onClick={() => setSelectedId(venue.id)}
-              >
-                <Pin
-                  background={venue.is_active ? '#16a34a' : '#9ca3af'}
-                  borderColor={venue.is_active ? '#14532d' : '#6b7280'}
-                  glyphColor="white"
-                />
-              </AdvancedMarker>
-            )
-          ))}
+        <div className="inner">
+          <h1 className="greeting">{clock ? <>{hello}<br />{subline}</> : <>Boston happy hours,<br />by the hour.</>}</h1>
 
-          {selectedVenue && (
-            <InfoWindow
-              position={{ lat: selectedVenue.latitude, lng: selectedVenue.longitude }}
-              onCloseClick={() => setSelectedId(null)}
-            >
-              <div style={{ maxWidth: '220px', padding: '4px' }}>
-                <h3 style={{ margin: '0 0 6px', fontSize: '15px' }}>{selectedVenue.name}</h3>
-                <p style={{ margin: '0 0 4px', fontSize: '13px', color: '#6b7280' }}>
-                  {selectedVenue.address}
-                </p>
-                <p style={{ margin: '0 0 4px', fontSize: '13px' }}>
-                  🕐 {selectedVenue.happy_hour_start} – {selectedVenue.happy_hour_end}
-                </p>
-                <p style={{ margin: '0 0 4px', fontSize: '13px' }}>
-                  📅 {selectedVenue.days_active?.join(', ')}
-                </p>
-                <p style={{ margin: '0', fontSize: '13px', fontWeight: 'bold', color: '#16a34a' }}>
-                  🍻 {selectedVenue.deals}
-                </p>
-                <span style={{
-                  display: 'inline-block', marginTop: '8px',
-                  background: selectedVenue.is_active ? '#dcfce7' : '#f3f4f6',
-                  color: selectedVenue.is_active ? '#16a34a' : '#6b7280',
-                  borderRadius: '12px', padding: '2px 10px', fontSize: '12px'
-                }}>
-                  {selectedVenue.is_active ? '✅ Active Now' : '⏸ Not Active'}
-                </span>
-                {selectedVenue.last_verified && (
-                  <p style={{ margin: '8px 0 0', fontSize: '11px', color: '#9ca3af' }}>
-                    Last confirmed {formatDate(selectedVenue.last_verified)}
-                  </p>
-                )}
+          <div className="search">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" aria-hidden="true" style={{ color: 'var(--muted)' }}><circle cx="11" cy="11" r="7" /><path d="M20 20l-3.5-3.5" /></svg>
+            <label htmlFor="search" className="sr-only">Search places, deals and neighborhoods</label>
+            <input
+              id="search"
+              type="search"
+              placeholder={mode === 'day' ? 'Tacos in the South End' : 'Oysters near the Seaport'}
+              value={filters.query}
+              onChange={e => setFilters(f => ({ ...f, query: e.target.value }))}
+            />
+            <button className="icon-btn" aria-label="Filters" onClick={() => setShowFilters(true)}>
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" aria-hidden="true"><path d="M4 6h16M7 12h10M10 18h4" /></svg>
+              {filterCount > 0 && <span className="badge">{filterCount}</span>}
+            </button>
+          </div>
+
+          <div className="chips scroll" style={{ marginTop: 14 }}>
+            <button className="chip" aria-pressed={onlyOpen} onClick={() => setOnlyOpen(o => !o)}>Open now</button>
+            {QUICK_TAGS[mode].filter(t => allTags.includes(t)).map(t => (
+              <button key={t} className="chip" aria-pressed={filters.tags.includes(t)} onClick={() => toggleQuickTag(t)}>{t}</button>
+            ))}
+          </div>
+
+          {clock && autoMode === 'day' && (
+            <div className="countdown">
+              <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="var(--accent-text)" strokeWidth="2" aria-hidden="true"><path d="M20 14.5A8 8 0 1 1 9.5 4 6.5 6.5 0 0 0 20 14.5z" /></svg>
+              <div style={{ flex: 1 }}>
+                <div className="countdown-title">Night mode at 4:00</div>
+                <div className="track" aria-hidden="true"><div style={{ width: `${Math.round(dayProgress * 100)}%` }} /></div>
               </div>
-            </InfoWindow>
+              <span style={{ fontSize: 12, color: 'var(--accent-text)' }}>{formatDuration(untilNight)}</span>
+            </div>
           )}
-        </Map>
-
-        {/* Legend */}
-        <div style={{
-          position: 'absolute', bottom: '24px', left: '16px', zIndex: 10,
-          background: 'white', borderRadius: '8px', padding: '10px 14px',
-          boxShadow: '0 2px 8px rgba(0,0,0,0.15)', fontSize: '13px'
-        }}>
-          <div style={{ display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '4px' }}>
-            <div style={{ width: '12px', height: '12px', borderRadius: '50%', background: '#16a34a' }}></div>
-            <span>Happy hour active now</span>
-          </div>
-          <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
-            <div style={{ width: '12px', height: '12px', borderRadius: '50%', background: '#9ca3af' }}></div>
-            <span>Not currently active</span>
-          </div>
         </div>
 
+        {loadError && <p className="empty">We couldn’t load happy hours right now. Try refreshing in a minute.</p>}
+        {!loadError && venues.length > 0 && shown.length === 0 && (
+          <p className="empty">Nothing matches those filters. Try clearing a few, or pick a wider time window.</p>
+        )}
+
+        {sections.filter(s => s.items.length).map(s => (
+          <section key={s.title} aria-label={s.title}>
+            <div className="section-head">
+              <h2 className="section-title">{s.title}</h2>
+              <span className="section-count">{s.items.length}</span>
+            </div>
+            {s.items.map(v => {
+              const pill = pillFor(v);
+              return (
+                <button key={v.id} className="row" onClick={() => setSelectedId(v.id)}>
+                  <div style={{ flex: 1, minWidth: 0 }}>
+                    <div className="row-name">{v.name}</div>
+                    <div className="row-meta">
+                      {[v.neighborhood, v.price_level ? '$'.repeat(v.price_level) : null].filter(Boolean).join(' · ')}
+                    </div>
+                    <div className="row-deal">{v.deal_headline || 'Happy hour specials'}</div>
+                  </div>
+                  <span className={`pill${pill.live ? ' live' : ''}`}>{pill.text}</span>
+                </button>
+              );
+            })}
+          </section>
+        ))}
+
+        <p className="footer-note">Our AI agent re-checks every deal each week. Double-check with the venue before you go.</p>
+      </main>
+
+      <div className="map-wrap">
+        <VenueMap venues={shown} mode={mode} onSelect={setSelectedId} />
       </div>
-    </APIProvider>
+
+      {showFilters && (
+        <FilterSheet
+          initial={filters}
+          tags={allTags}
+          neighborhoods={neighborhoods}
+          resultCount={f => venues.filter(v => matchesFilters(v, f)).length}
+          onApply={f => { setFilters(f); setShowFilters(false); }}
+          onClose={() => setShowFilters(false)}
+        />
+      )}
+      {selected && <PlaceSheet venue={selected} onClose={() => setSelectedId(null)} />}
+    </div>
   );
 }
