@@ -83,6 +83,7 @@ export function matchesFilters(venue: Venue, f: Filters): boolean {
   if (f.prices.length && !(venue.price_level && f.prices.includes(venue.price_level))) return false;
   if (f.neighborhoods.length && !(venue.neighborhood && f.neighborhoods.includes(venue.neighborhood))) return false;
   if (f.hours && !overlapsHours(venue, f.hours)) return false;
+  if (f.days.length && !venue.days_active?.some(d => f.days.includes(d))) return false;
   return true;
 }
 
